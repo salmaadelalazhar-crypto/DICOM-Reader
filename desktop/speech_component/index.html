@@ -1,0 +1,21 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+body{margin:0;font-family:sans-serif}button{font-size:18px;font-weight:700;padding:10px 18px;border:3px solid #0b5394;border-radius:10px;background:#f8f8f8;color:#111;cursor:pointer}button:focus{outline:4px solid #ffbf00}#error{color:#a10d20;margin-top:8px}
+</style></head><body><button id="speech" type="button"></button><div id="error" role="status"></div><script>
+let args={},active=false,timer=null;
+function send(type,more={}){parent.postMessage({isStreamlitMessage:true,type,...more},'*')}
+function size(){send('streamlit:setFrameHeight',{height:document.body.scrollHeight+8})}
+function bridge(){try{return window.top.pywebview?.api}catch{return null}}
+function label(){document.getElementById('speech').textContent=active?args.stop_prompt:args.start_prompt;document.body.dir=args.language==='ar'?'rtl':'ltr';size()}
+window.addEventListener('message',e=>{if(e.data.type==='streamlit:render'){args=e.data.args;label()}});
+document.getElementById('speech').onclick=async()=>{
+ const api=bridge(),error=document.getElementById('error');error.textContent='';
+ if(!api){error.textContent=args.language==='ar'?'افتح التطبيق من برنامج الكمبيوتر.':'Open this app using the desktop program.';size();return}
+ if(active){active=false;clearInterval(timer);await api.stop_speech();label();return}
+ const result=await api.start_speech(args.language);if(!result.ok){error.textContent=result.error;size();return}
+ active=true;label();timer=setInterval(async()=>{
+   const data=await api.poll_speech();if(data.error){error.textContent=data.error;size()}
+   if(data.items.length){if(args.just_once){active=false;clearInterval(timer);await api.stop_speech();label()}const item={id:data.items.map(x=>x.id).join('-'),text:data.items.map(x=>x.text).join(' ')};send('streamlit:setComponentValue',{value:item})}
+ },500)
+};
+send('streamlit:componentReady',{apiVersion:1});size();
+</script></body></html>
