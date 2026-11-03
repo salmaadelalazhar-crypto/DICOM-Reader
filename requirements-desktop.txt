@@ -1,0 +1,20 @@
+-r requirements.txt
+streamlit==1.51.0
+pydicom==3.0.1
+pylibjpeg==2.1.0
+pylibjpeg-libjpeg==2.3.0
+numpy==2.2.6
+pandas==2.2.3
+openpyxl==3.1.5
+gTTS==2.5.4
+torch==2.7.1
+monai==1.5.1
+google-genai==1.55.0
+streamlit-mic-recorder==0.0.8
+pywebview==6.0
+pyinstaller==6.16.0
+pyinstaller-hooks-contrib==2025.9
+SpeechRecognition==3.14.3
+PyAudio==0.2.14
+keyring==25.6.0
+imageio-ffmpeg==0.6.0
