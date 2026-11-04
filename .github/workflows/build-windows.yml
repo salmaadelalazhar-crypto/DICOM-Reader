@@ -1,0 +1,42 @@
+name: Build Windows desktop EXE
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: x64
+          cache: pip
+      - name: Install CPU PyTorch and desktop dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements-desktop.txt
+      - name: Run processing, locale, and service tests
+        run: python -m unittest discover -s tests -v
+      - name: Build executable
+        run: python build_windows.py
+      - name: Check frozen worker startup and shutdown
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath './dist/DICOMReader/DICOMReader.exe' -ArgumentList '--smoke-test' -PassThru
+          if (-not $p.WaitForExit(240000)) { $p.Kill(); throw 'Frozen worker startup timed out' }
+          if ($p.ExitCode -ne 0) { throw 'Frozen application smoke test failed' }
+      - name: Add instructions to application folder
+        shell: pwsh
+        run: Copy-Item README.md,DESKTOP_GUIDE.md dist/DICOMReader/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DICOMReader-Windows-x64
+          path: dist/DICOMReader/
+          if-no-files-found: error
+          retention-days: 14
