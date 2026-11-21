@@ -1,0 +1,16 @@
+# Exact versions used to build the Windows program (Python 3.11, 64-bit).
+PySide6==6.9.2
+pydicom==3.0.1
+pylibjpeg==2.1.0
+pylibjpeg-libjpeg==2.3.0
+numpy==2.2.6
+pandas==2.2.3
+openpyxl==3.1.5
+torch==2.7.1
+monai==1.5.1
+gTTS==2.5.4
+google-genai==1.55.0
+SpeechRecognition==3.14.3
+PyAudio==0.2.14
+pyinstaller==6.16.0
+pyinstaller-hooks-contrib==2025.9
