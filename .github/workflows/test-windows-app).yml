@@ -1,0 +1,438 @@
+name: Test Windows app (basic, no AI)
+
+# Takes the latest DICOMReader-Windows-x64 artifact built in this repository and tests it on a CLEAN
+# machine: Python and every Python library already on the GitHub server are hidden first, and nothing
+# is installed. Then it installs the app (copies the folder), downloads a DICOM scan from OUTSIDE the
+# app (the app has no scan file of its own), starts the app normally, uploads the scan with its "Choose file"
+# button, checks the MONAI report and turns it into sound. The app's own test switches are not used. Gemini is NOT tested (it needs an API key).
+# This file never installs Python or any library.
+on:
+  workflow_dispatch:
+    inputs:
+      dicom_url:
+        description: 'Link to a .dcm (or .zip) scan to test with. Empty = a public anonymous sample CT scan.'
+        required: false
+        default: ''
+  workflow_run:
+    workflows: ['Build Windows desktop EXE']
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  test:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: windows-2022
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Find the latest successful build
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ('${{ github.event_name }}' -eq 'workflow_run') {
+            $id = '${{ github.event.workflow_run.id }}'
+          } else {
+            $id = gh run list -R $env:GITHUB_REPOSITORY --workflow build-windows.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId'
+          }
+          if (-not $id) { throw 'No successful build found. Run "Build Windows desktop EXE" first.' }
+          Write-Host "Testing the app built in run $id"
+          "run_id=$id" >> $env:GITHUB_OUTPUT
+
+      - name: Download the app artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: DICOMReader-Windows-x64
+          path: downloaded-app
+          run-id: ${{ steps.find.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Make the machine clean (hide Python and all libraries)
+        run: |
+          # GitHub's Windows servers come with Python, pip and Conda. They are renamed or removed from
+          # PATH so the app can only use the Python and libraries packed inside its own folder.
+          $hidden = @()
+          $places = @("$env:RUNNER_TOOL_CACHE\Python", 'C:\hostedtoolcache\windows\Python',
+                      "$env:APPDATA\Python", "$env:LOCALAPPDATA\Programs\Python",
+                      'C:\Miniconda', 'C:\Miniconda3', 'C:\Program Files\Python*', 'C:\Python*',
+                      'C:\Windows\py.exe', 'C:\Windows\pyw.exe')
+          foreach ($place in $places) {
+            foreach ($item in (Get-Item -Path $place -Force -ErrorAction SilentlyContinue)) {
+              try {
+                Rename-Item -LiteralPath $item.FullName -NewName ($item.Name + '.hidden-for-test') -Force -ErrorAction Stop
+                $hidden += $item.FullName
+              } catch { Write-Host "Could not rename $($item.FullName) (it is removed from PATH instead)." }
+            }
+          }
+          $keep = $env:Path -split ';' | Where-Object {
+            $_ -and ($_ -notmatch '(?i)python|conda|pip') -and
+            -not (Test-Path (Join-Path $_ 'python.exe')) -and -not (Test-Path (Join-Path $_ 'python3.exe')) -and
+            -not (Test-Path (Join-Path $_ 'pip.exe'))
+          }
+          "CLEAN_PATH=$($keep -join ';')" >> $env:GITHUB_ENV
+          Write-Host 'Hidden:'; $hidden | ForEach-Object { Write-Host "  $_" }
+
+      - name: Install the app
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path 'downloaded-app/DICOMReader.exe')) { throw 'DICOMReader.exe is missing from the artifact' }
+          if (-not (Test-Path 'downloaded-app/_internal')) { throw 'The _internal folder is missing from the artifact' }
+          # The program needs no installer: installing = copying the whole folder, like a user does.
+          $target = Join-Path $env:LOCALAPPDATA 'Programs/DICOMReader'
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Copy-Item -Path 'downloaded-app/*' -Destination $target -Recurse -Force
+          Write-Host "Installed to $target"
+
+      - name: Get a DICOM scan file from outside the app
+        # The app contains no scan file. The test downloads one, just as a user brings their own file.
+        env:
+          DICOM_URL: ${{ github.event.inputs.dicom_url }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Default: the public, anonymous CT sample published by the pydicom project (pinned version + checksum).
+          $default = 'https://raw.githubusercontent.com/pydicom/pydicom/v3.0.1/src/pydicom/data/test_files/CT_small.dcm'
+          $url = if ($env:DICOM_URL) { $env:DICOM_URL.Trim() } else { $default }
+          $name = [System.IO.Path]::GetFileName(([Uri]$url).AbsolutePath)
+          if (-not $name -or $name -notmatch '(?i)\.(dcm|zip)$') { $name = 'downloaded_scan.dcm' }
+          $folder = Join-Path $env:RUNNER_TEMP 'scan'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          $file = Join-Path $folder $name
+          Write-Host "Downloading the scan file: $url"
+          try { Invoke-WebRequest -Uri $url -OutFile $file -UseBasicParsing }
+          catch { throw "Could not download the scan file from $url : $_" }
+          $bytes = [System.IO.File]::ReadAllBytes($file)
+          $isDicom = $bytes.Length -gt 132 -and [System.Text.Encoding]::ASCII.GetString($bytes, 128, 4) -eq 'DICM'
+          $isZip = $bytes.Length -gt 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B
+          if (-not ($isDicom -or $isZip)) { throw "The downloaded file is not a DICOM (.dcm) or ZIP file: $url" }
+          if ($url -eq $default) {
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+            if ($hash -ne '3dd31e5cc835b3f2cdd46c9da1982f59251e78518fefa8163d914631c66437d6') { throw "The sample scan changed (SHA256 $hash)." }
+          }
+          Write-Host "Scan file ready: $file ($($bytes.Length) bytes)"
+          "SCAN_FILE=$file" >> $env:GITHUB_ENV
+
+      - name: Open the app and upload the downloaded DICOM with its Choose file button, MONAI report and sound
+        # The app is started normally (no test switches) and used like a person would, through Windows UI
+        # Automation: press "Choose file", pick the downloaded scan in the Windows file window, wait for the
+        # MONAI report, press "Listen to the report" and save the MP3. Windows PowerShell is part of Windows, not Python.
+        shell: powershell
+        run: |
+          $env:Path = $env:CLEAN_PATH
+          foreach ($name in 'PYTHONHOME','PYTHONPATH','PYTHONUTF8','PYTHONIOENCODING','PYTHONSTARTUP','VIRTUAL_ENV','CONDA_PREFIX','PIP_DISABLE_PIP_VERSION_CHECK','PIP_NO_INPUT','GEMINI_API_KEY') {
+            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+          }
+          $found = Get-Command python, python3, py, pip, pip3, conda -ErrorAction SilentlyContinue
+          if ($found) { throw ('The machine is not clean, Python is still visible: ' + (($found | ForEach-Object { $_.Source }) -join ', ')) }
+          Write-Host 'Clean machine confirmed: no Python, pip, Conda or Python libraries can be found.'
+          if (-not $env:SCAN_FILE -or -not (Test-Path $env:SCAN_FILE)) { throw 'No scan file was downloaded for the test.' }
+
+          Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing, System.Windows.Forms
+          # Native Windows calls are part of Windows itself. Unlike UI Automation, EnumWindows also
+          # sees the common #32770 file dialog reliably, and a real mouse click never blocks this script.
+          Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class DicomTestWin32 {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
+  [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr hDlg, int itemId);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr hWnd, uint message, IntPtr wParam, string lParam);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
+}
+"@
+          $AE = [System.Windows.Automation.AutomationElement]
+          $TS = [System.Windows.Automation.TreeScope]
+          $all = [System.Windows.Automation.Condition]::TrueCondition
+
+          # The app's own button and message texts (English and Arabic, written as \u codes so any file encoding works).
+          $T = @{
+            en = @{
+              choose = [regex]::Unescape('\uD83D\uDCC2 Choose file')
+              report = [regex]::Unescape('Descriptive report')
+              image = [regex]::Unescape('Radiology image')
+              listen = [regex]::Unescape('\uD83D\uDD0A Listen to the report')
+              save_audio = [regex]::Unescape('Download MONAI audio (MP3)')
+              gtts_fail = [regex]::Unescape('Unable to connect to gTTS. Use the alternative reader below.')
+              gtts_missing = [regex]::Unescape('gTTS is not installed. Use the alternative reader below.')
+              read_fail = [regex]::Unescape('Unable to read the files. Check that they are valid DICOM files containing images.')
+              no_play = [regex]::Unescape('Unable to play audio on this device.')
+            }
+            ar = @{
+              choose = [regex]::Unescape('\uD83D\uDCC2 \u0627\u062E\u062A\u064A\u0627\u0631 \u0645\u0644\u0641')
+              report = [regex]::Unescape('\u0627\u0644\u062A\u0642\u0631\u064A\u0631 \u0627\u0644\u0648\u0635\u0641\u064A')
+              image = [regex]::Unescape('\u0635\u0648\u0631\u0629 \u0627\u0644\u0623\u0634\u0639\u0629')
+              listen = [regex]::Unescape('\uD83D\uDD0A \u0627\u0644\u0627\u0633\u062A\u0645\u0627\u0639 \u0644\u0644\u062A\u0642\u0631\u064A\u0631')
+              save_audio = [regex]::Unescape('\u062A\u0646\u0632\u064A\u0644 \u0635\u0648\u062A MONAI (MP3)')
+              gtts_fail = [regex]::Unescape('\u062A\u0639\u0630\u0651\u0631 \u0627\u0644\u0627\u062A\u0635\u0627\u0644 \u0628\u062E\u062F\u0645\u0629 gTTS\u060C \u0627\u0633\u062A\u062E\u062F\u0645 \u0627\u0644\u0642\u0627\u0631\u0626 \u0627\u0644\u0628\u062F\u064A\u0644 \u0623\u062F\u0646\u0627\u0647.')
+              gtts_missing = [regex]::Unescape('\u0645\u0643\u062A\u0628\u0629 gTTS \u063A\u064A\u0631 \u0645\u062B\u0628\u062A\u0629\u060C \u0627\u0633\u062A\u062E\u062F\u0645 \u0627\u0644\u0642\u0627\u0631\u0626 \u0627\u0644\u0628\u062F\u064A\u0644 \u0623\u062F\u0646\u0627\u0647.')
+              read_fail = [regex]::Unescape('\u062A\u0639\u0630\u0651\u0631\u062A \u0642\u0631\u0627\u0621\u0629 \u0627\u0644\u0645\u0644\u0641\u0627\u062A. \u062A\u0623\u0643\u062F \u0623\u0646\u0647\u0627 \u0645\u0644\u0641\u0627\u062A DICOM \u0633\u0644\u064A\u0645\u0629 \u062A\u062D\u062A\u0648\u064A \u0639\u0644\u0649 \u0635\u0648\u0631.')
+              no_play = [regex]::Unescape('\u062A\u0639\u0630\u0651\u0631 \u062A\u0634\u063A\u064A\u0644 \u0627\u0644\u0635\u0648\u062A \u0639\u0644\u0649 \u0647\u0630\u0627 \u0627\u0644\u062C\u0647\u0627\u0632.')
+            }
+          }
+
+          function Get-AppWindows([int]$procId) {
+            $cond = New-Object System.Windows.Automation.PropertyCondition($AE::ProcessIdProperty, $procId)
+            return @($AE::RootElement.FindAll($TS::Children, $cond))
+          }
+          function Get-Elements($window) { try { return @($window.FindAll($TS::Descendants, $all)) } catch { return @() } }
+          function Find-Named([int]$procId, [string]$name) {
+            foreach ($w in (Get-AppWindows $procId)) {
+              foreach ($e in (Get-Elements $w)) { try { if ($e.Current.Name -eq $name) { return $e } } catch {} }
+            }
+            return $null
+          }
+          function Get-AllTexts([int]$procId) {
+            $texts = @()
+            foreach ($w in (Get-AppWindows $procId)) {
+              try { $texts += $w.Current.Name } catch {}
+              foreach ($e in (Get-Elements $w)) { try { if ($e.Current.Name -and $e.Current.Name.Trim()) { $texts += $e.Current.Name.Trim() } } catch {} }
+            }
+            return @($texts | Select-Object -Unique)
+          }
+          # A real click returns immediately even when the button opens a modal file dialog. InvokePattern
+          # is only a fallback for non-dialog buttons hidden below the scroll area; invoking one of those
+          # dialog buttons in another PowerShell runspace was the cause of the missed file window.
+          function Press($element, [switch]$OpensDialog) {
+            if (-not $element) { throw 'The button to press was not found.' }
+            try { $element.GetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern).ScrollIntoView() } catch {}
+            Start-Sleep -Milliseconds 250
+            try { $r = $element.Current.BoundingRectangle } catch { $r = $null }
+            if ($r -and $r.Width -gt 0 -and $r.Height -gt 0 -and -not $element.Current.IsOffscreen) {
+              $x = [int]($r.Left + $r.Width / 2)
+              $y = [int]($r.Top + $r.Height / 2)
+              if (-not [DicomTestWin32]::SetCursorPos($x, $y)) { throw "Windows could not move the mouse to the button at $x,$y." }
+              Start-Sleep -Milliseconds 150
+              [DicomTestWin32]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero) # left button down
+              [DicomTestWin32]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero) # left button up
+            } elseif (-not $OpensDialog) {
+              $element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            } else {
+              throw 'The button that opens the Windows file window is outside the visible app window.'
+            }
+          }
+          function Wait-Until([scriptblock]$test, [int]$seconds) {
+            $deadline = (Get-Date).AddSeconds($seconds)
+            while ((Get-Date) -lt $deadline) {
+              $value = & $test
+              if ($value) { return $value }
+              if ($script:proc.HasExited) { return $null }
+              Start-Sleep -Milliseconds 700
+            }
+            return $null
+          }
+          # Find Qt's native Windows open/save dialog by its real Win32 class and owner process.
+          # UIA alone can omit this system dialog on a Windows Server runner.
+          function Get-FileDialogHandle([int]$procId) {
+            $script:fileDialogs = New-Object System.Collections.ArrayList
+            $callback = [DicomTestWin32+EnumWindowsProc]{
+              param($hWnd, $lParam)
+              $ownerPid = [uint32]0
+              [void][DicomTestWin32]::GetWindowThreadProcessId($hWnd, [ref]$ownerPid)
+              $className = New-Object System.Text.StringBuilder 256
+              [void][DicomTestWin32]::GetClassName($hWnd, $className, $className.Capacity)
+              if ($ownerPid -eq $lParam.ToInt32() -and $className.ToString() -eq '#32770') {
+                [void]$script:fileDialogs.Add($hWnd)
+              }
+              return $true
+            }
+            [void][DicomTestWin32]::EnumWindows($callback, [IntPtr]$procId)
+            if ($script:fileDialogs.Count -gt 0) { return [IntPtr]$script:fileDialogs[0] }
+            return [IntPtr]::Zero
+          }
+          # Fill the standard Windows file-name combo (control 1148) and press its Open/Save button (ID 1).
+          function Use-FileWindow([int]$procId, [string]$path) {
+            $dialog = Wait-Until { $h = Get-FileDialogHandle $procId; if ($h -ne [IntPtr]::Zero) { $h } } 60
+            if (-not $dialog -or $dialog -eq [IntPtr]::Zero) { return 'the Windows file window did not open after the real mouse click' }
+            $fileName = [DicomTestWin32]::GetDlgItem($dialog, 1148)
+            if ($fileName -eq [IntPtr]::Zero) { $fileName = [DicomTestWin32]::GetDlgItem($dialog, 1001) }
+            if ($fileName -eq [IntPtr]::Zero) { return 'the file name box (Windows control 1148) was not found in the file window' }
+            [void][DicomTestWin32]::SendMessage($fileName, 0x000C, [IntPtr]::Zero, $path) # WM_SETTEXT
+            $ok = [DicomTestWin32]::GetDlgItem($dialog, 1)
+            if ($ok -eq [IntPtr]::Zero) { return 'the Open/Save button (Windows control 1) was not found in the file window' }
+            if (-not [DicomTestWin32]::PostMessage($ok, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)) { # BM_CLICK
+              return 'Windows did not accept the click on the Open/Save button'
+            }
+            $closed = Wait-Until { (Get-FileDialogHandle $procId) -eq [IntPtr]::Zero } 30
+            if (-not $closed) { return 'the Windows file window did not close after choosing the file' }
+            return ''
+          }
+          function Save-Screen([string]$path) {
+            try {
+              $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+              $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+              $bmp.Save($path); $g.Dispose(); $bmp.Dispose()
+              Write-Host "Screenshot saved: $path"
+            } catch { Write-Host "Screenshot not possible on this machine: $_" }
+          }
+          function Escape-Annotation([string]$s) { return $s.Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A') }
+
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs/DICOMReader/DICOMReader.exe'
+          $log = Join-Path $env:LOCALAPPDATA 'DICOMReader/startup.log'
+          $results = Join-Path $env:RUNNER_TEMP 'basic-check'
+          # The workflow creates every output folder first. The unchanged app can then save MP3 files
+          # to the absolute path chosen in its normal Save window; this script writes the MONAI text
+          # report and copies any app error log into the same results folder.
+          New-Item -ItemType Directory -Force -Path $results | Out-Null
+          $missingPattern = '(?i)PACKAGE INCOMPLETE|LIBRARY MISSING|ModuleNotFoundError|No module named|ImportError|DLL load failed|Failed to load Python DLL|python3\d*\.dll|\.dll was not found|could not load the Qt platform plugin|cannot load library|VCRUNTIME|NumPy \('
+          $missingCodes = @(-1073741515, -1073741701)   # Windows: required DLL not found / bad DLL
+          $failed = $false
+          $scanName = Split-Path $env:SCAN_FILE -Leaf
+          Add-Content $env:GITHUB_STEP_SUMMARY "## DICOMReader basic check on a clean machine (no Python, no libraries)`n`nScan file uploaded: ``$scanName```n"
+
+          foreach ($lang in 'en', 'ar') {
+            $S = $T[$lang]
+            $env:DICOM_DEVICE_LANGUAGE = $lang
+            $out = Join-Path $results $lang
+            New-Item -ItemType Directory -Force -Path $out | Out-Null
+            Remove-Item $log -ErrorAction SilentlyContinue
+            $lines = @("Basic check - language: $lang - scan file: $scanName")
+            $state = @{ ok = $true; stop = $false }
+            function Record([string]$status, [string]$step, [string]$detail = '') {
+              if ($status -eq 'FAIL') { $state.ok = $false; $state.stop = $true }
+              $line = ('{0,-5} {1}' -f $status, $step) + $(if ($detail) { " - $detail" } else { '' })
+              $script:lines += $line
+              Write-Host $line
+            }
+            Write-Host "===== Basic check ($lang) ====="
+
+            # 1. Start the app normally, exactly like double-clicking DICOMReader.exe.
+            $script:proc = Start-Process -FilePath $exe -PassThru
+            $null = $proc.Handle
+            $chooseBtn = Wait-Until { if (Test-Path $log) { 'startup-error' } else { Find-Named $proc.Id $S.choose } } 240
+            if (-not $chooseBtn -or $chooseBtn -eq 'startup-error') {
+              Start-Sleep -Seconds 3
+              $why = if ($proc.HasExited) { "the app closed by itself (exit code $($proc.ExitCode))" } elseif ($chooseBtn) { 'the app could not start and showed an error window' } else { 'the app window did not appear within 4 minutes' }
+              Record 'FAIL' '1. Program window opened' $why
+            } else { Record 'PASS' '1. Program window opened' }
+
+            # 2. Upload the downloaded scan with the Choose file button and the Windows file window.
+            if (-not $state.stop) {
+              Press $chooseBtn -OpensDialog
+              $problem = Use-FileWindow $proc.Id $env:SCAN_FILE
+              if ($problem) { Record 'FAIL' '2. Uploading the DICOM file (Choose file button)' $problem }
+            }
+            if (-not $state.stop) {
+              $shown = Wait-Until {
+                $texts = Get-AllTexts $proc.Id
+                if ($texts -contains $S.report) { 'report' } elseif ($texts -contains $S.read_fail) { 'unreadable' } else { $null }
+              } 600
+              if ($shown -eq 'report') { Record 'PASS' '2. Uploading the DICOM file (Choose file button)' $scanName }
+              else {
+                $msg = if ($shown) { $S.read_fail } elseif ($proc.HasExited) { "the app closed by itself (exit code $($proc.ExitCode))" } else { 'no result after 10 minutes' }
+                Record 'FAIL' '2. Uploading the DICOM file (Choose file button)' ("program message: $msg")
+              }
+            }
+
+            # 3-5. Image, technical data and the MONAI report shown by the app.
+            if (-not $state.stop) {
+              $image = Find-Named $proc.Id $S.image
+              Record $(if ($image) { 'PASS' } else { 'FAIL' }) '3. Image and technical data shown'
+              $reportText = ''
+              foreach ($w in (Get-AppWindows $proc.Id)) {
+                foreach ($e in (Get-Elements $w)) {
+                  try { if ($e.Current.Name -eq $S.report -and $e.Current.HelpText) { $reportText = $e.Current.HelpText } } catch {}
+                }
+              }
+              if ($reportText) {
+                [System.IO.File]::WriteAllText((Join-Path $out 'monai_report.txt'), $reportText, [System.Text.Encoding]::UTF8)
+                Record 'PASS' '4. MONAI descriptive report created' "$($reportText.Length) characters"
+                if ($reportText -like '*MONAI + PyTorch*') { Record 'PASS' '5. MONAI + PyTorch engine used' }
+                else { Record 'FAIL' '5. MONAI + PyTorch engine used' 'LIBRARY MISSING: the report says the NumPy fallback was used, so MONAI/PyTorch could not be loaded from the program folder' }
+              } else { Record 'FAIL' '4. MONAI descriptive report created' 'the report text could not be read from the app window' }
+            }
+
+            # 6. Listen button -> gTTS sound; 7. save it with the app's download button and check it is a real MP3.
+            if (-not $state.stop) {
+              $listen = Find-Named $proc.Id $S.listen
+              if (-not $listen) { Record 'FAIL' '6. Report converted to sound (gTTS)' 'the listen button was not found' }
+              else {
+                Press $listen
+                $audio = Wait-Until {
+                  $texts = Get-AllTexts $proc.Id
+                  if ($texts -contains $S.save_audio) { 'ok' } elseif ($texts -contains $S.gtts_fail) { $S.gtts_fail } elseif ($texts -contains $S.gtts_missing) { 'LIBRARY MISSING: ' + $S.gtts_missing } else { $null }
+                } 240
+                if ($audio -eq 'ok') { Record 'PASS' '6. Report converted to sound (gTTS)' }
+                else { Record 'FAIL' '6. Report converted to sound (gTTS)' ('program message: ' + $(if ($audio) { $audio } else { 'no sound after 4 minutes' })) }
+              }
+            }
+            if (-not $state.stop) {
+              $mp3 = Join-Path $out "monai_report_$lang.mp3"
+              Press (Find-Named $proc.Id $S.save_audio) -OpensDialog
+              $problem = Use-FileWindow $proc.Id $mp3
+              $null = Wait-Until { Test-Path $mp3 } 20
+              if ($problem) { Record 'FAIL' '7. Sound saved as MP3 with the download button' $problem }
+              elseif (-not (Test-Path $mp3)) { Record 'FAIL' '7. Sound saved as MP3 with the download button' 'the file was not saved' }
+              else {
+                $b = [System.IO.File]::ReadAllBytes($mp3)
+                $valid = $b.Length -gt 1000 -and (([System.Text.Encoding]::ASCII.GetString($b, 0, 3) -eq 'ID3') -or $b[0] -eq 0xFF)
+                Record $(if ($valid) { 'PASS' } else { 'FAIL' }) '7. Sound saved as MP3 with the download button' "$($b.Length) bytes"
+                if ((Get-AllTexts $proc.Id) -contains $S.no_play) { Record 'INFO' '8. Playing the sound' ('program message: ' + $S.no_play + ' (this server usually has no speakers)') }
+              }
+            }
+            Record 'INFO' '9. Gemini AI' 'not tested (needs an API key)'
+
+            # Anything the app showed (error boxes, messages) and a screenshot, then close the app.
+            $windowTexts = if (-not $proc.HasExited) { Get-AllTexts $proc.Id } else { @() }
+            if (-not $state.ok) { Save-Screen (Join-Path $out 'screen.png') }
+            if (-not $proc.HasExited) {
+              $null = $proc.CloseMainWindow()
+              if (-not $proc.WaitForExit(20000)) { try { $proc.Kill() } catch {} ; $proc.WaitForExit(10000) | Out-Null }
+            }
+            Record $(if ($state.ok) { 'PASS' } else { 'FAIL' }) 'BASIC CHECK RESULT'
+            [System.IO.File]::WriteAllLines((Join-Path $out 'result.txt'), [string[]]$lines, [System.Text.Encoding]::UTF8)
+            $logText = if (Test-Path $log) { Get-Content $log -Encoding utf8 } else { @() }
+            if (Test-Path $log) {
+              # Preserve the app's own error file with the other results; no app-side path support is needed.
+              Copy-Item -LiteralPath $log -Destination (Join-Path $out 'startup.log') -Force
+            }
+            if ($logText) { Write-Host '--- Error log written by the app (startup.log) ---'; $logText | Select-Object -Last 80 | ForEach-Object { Write-Host $_ } }
+            if (-not $state.ok -and $windowTexts) {
+              Write-Host '--- Text shown in the app windows ---'; $windowTexts | ForEach-Object { Write-Host $_ }
+              [System.IO.File]::WriteAllLines((Join-Path $out 'window_text.txt'), [string[]]$windowTexts, [System.Text.Encoding]::UTF8)
+            }
+
+            if ($state.ok) {
+              Add-Content $env:GITHUB_STEP_SUMMARY "- **$lang**: PASS`n"
+              continue
+            }
+            $failed = $true
+            $code = if ($proc.HasExited) { $proc.ExitCode } else { -1 }
+            # The exact message the app itself gave, in order of reliability.
+            $exact = ($logText | Where-Object { $_ -like 'Exact error shown by the program:*' } | Select-Object -First 1)
+            if (-not $exact) { $exact = (($lines | Where-Object { $_ -like 'FAIL*' -and $_ -notlike '*BASIC CHECK RESULT*' }) -join "`n") }
+            if (-not $exact) { $exact = "The app closed without any message (exit code $code)." }
+            $everything = (@($lines) + @($logText) + @($windowTexts)) -join "`n"
+            if (($everything -match $missingPattern) -or ($missingCodes -contains $code)) {
+              $title = "App did not work: Python or a library is missing from the app folder ($lang)"
+              $text = 'The app could not run without Python and libraries installed on the machine, so something is missing from the packaged folder (_internal). Error shown by the app: ' + $exact
+            } else {
+              $title = "App did not work ($lang)"
+              $text = "Exit code $code. Error shown by the app: " + $exact
+            }
+            Write-Host ("::error title=$title::" + (Escape-Annotation $text))
+            Add-Content $env:GITHUB_STEP_SUMMARY ("- **$lang**: FAIL - $title`n`n  ``````text`n  " + ($exact -replace "`n", "`n  ") + "`n  ```````n")
+          }
+          if ($failed) { throw 'Basic check failed - the exact error shown by the app is printed above and in the run summary.' }
+          Write-Host 'Basic check passed in English and Arabic on a clean machine (no Python, no libraries).'
+
+      - name: Save test results (report text, MP3, errors, screenshots)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DICOMReader-basic-check-results
+          path: ${{ runner.temp }}/basic-check/
+          if-no-files-found: ignore
+          retention-days: 14
